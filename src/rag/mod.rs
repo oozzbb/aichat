@@ -1,4 +1,3 @@
-use self::bm25::*;
 use self::loader::*;
 use self::splitter::*;
 
@@ -6,20 +5,19 @@ use crate::client::*;
 use crate::config::*;
 use crate::utils::*;
 
-mod bm25;
 mod loader;
 mod serde_vectors;
 mod splitter;
 
 use anyhow::{anyhow, bail, Context, Result};
+use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
 use inquire::{required, validator::Validation, Confirm, Select, Text};
 use parking_lot::RwLock;
-use path_absolutize::Absolutize;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{collections::HashMap, env, fmt::Debug, fs, path::Path, time::Duration};
+use std::{collections::HashMap, env, fmt::Debug, fs, hash::Hash, path::Path, time::Duration};
 use tokio::time::sleep;
 
 pub struct Rag {
@@ -28,7 +26,7 @@ pub struct Rag {
     path: String,
     embedding_model: Model,
     hnsw: Hnsw<'static, f32, DistCosine>,
-    bm25: BM25<DocumentId>,
+    bm25: SearchEngine<DocumentId>,
     data: RagData,
     last_sources: RwLock<Option<String>>,
 }
@@ -52,7 +50,7 @@ impl Clone for Rag {
             path: self.path.clone(),
             embedding_model: self.embedding_model.clone(),
             hnsw: self.data.build_hnsw(),
-            bm25: self.bm25.clone(),
+            bm25: self.data.build_bm25(),
             data: self.data.clone(),
             last_sources: RwLock::new(None),
         }
@@ -67,7 +65,10 @@ impl Rag {
         doc_paths: &[String],
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        debug!("init rag: {name}");
+        if !*IS_STDOUT_TERMINAL {
+            bail!("Failed to init rag in non-interactive mode");
+        }
+        println!("⚙ Initializing RAG...");
         let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(config)?;
         let (reranker_model, top_k) = {
             let config = config.read();
@@ -86,7 +87,6 @@ impl Rag {
         if paths.is_empty() {
             paths = add_documents()?;
         };
-        debug!("doc paths: {paths:?}");
         let loaders = config.read().document_loaders.clone();
         let spinner = create_spinner("Starting").await;
         tokio::select! {
@@ -94,13 +94,13 @@ impl Rag {
                 spinner.stop();
                 ret?;
             }
-            _ = watch_abort_signal(abort_signal) => {
+            _ = wait_abort_signal(&abort_signal) => {
                 spinner.stop();
                 bail!("Aborted!")
             },
         };
         if rag.save()? {
-            println!("✨ Saved rag to '{}'", save_path.display());
+            println!("✓ Saved RAG to '{}'.", save_path.display());
         }
         Ok(rag)
     }
@@ -129,27 +129,33 @@ impl Rag {
         Ok(rag)
     }
 
-    pub async fn rebuild(
+    pub fn document_paths(&self) -> &[String] {
+        &self.data.document_paths
+    }
+
+    pub async fn refresh_document_paths<T>(
         &mut self,
+        document_paths: &[T],
         config: &GlobalConfig,
         abort_signal: AbortSignal,
-    ) -> Result<()> {
-        debug!("rebuild rag: {}", self.name);
+    ) -> Result<()>
+    where
+        T: AsRef<str>,
+    {
         let loaders = config.read().document_loaders.clone();
         let spinner = create_spinner("Starting").await;
-        let paths = self.data.document_paths.clone();
         tokio::select! {
-            ret = self.sync_documents(loaders, &paths, Some(spinner.clone())) => {
+            ret = self.sync_documents(loaders, document_paths, Some(spinner.clone())) => {
                 spinner.stop();
                 ret?;
             }
-            _ = watch_abort_signal(abort_signal) => {
+            _ = wait_abort_signal(&abort_signal) => {
                 spinner.stop();
                 bail!("Aborted!")
             },
         };
         if self.save()? {
-            println!("✨ Saved rag to '{}'", self.path);
+            println!("✓ Saved rag to '{}'.", self.path);
         }
         Ok(())
     }
@@ -173,13 +179,7 @@ impl Rag {
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }
-                if *IS_STDOUT_TERMINAL {
-                    select_embedding_model(&models)?
-                } else {
-                    let value = models[0].id();
-                    println!("Select embedding model: {value}");
-                    value
-                }
+                select_embedding_model(&models)?
             }
         };
         let embedding_model = Model::retrieve_embedding(&config.read(), &embedding_model_id)?;
@@ -189,15 +189,7 @@ impl Rag {
                 println!("Set chunk size: {value}");
                 value
             }
-            None => {
-                if *IS_STDOUT_TERMINAL {
-                    set_chunk_size(&embedding_model)?
-                } else {
-                    let value = embedding_model.default_chunk_size();
-                    println!("Set chunk size: {value}");
-                    value
-                }
-            }
+            None => set_chunk_size(&embedding_model)?,
         };
         let chunk_overlap = match chunk_overlap {
             Some(value) => {
@@ -206,12 +198,7 @@ impl Rag {
             }
             None => {
                 let value = chunk_size / 20;
-                if *IS_STDOUT_TERMINAL {
-                    set_chunk_overlay(value)?
-                } else {
-                    println!("Set chunk overlay: {value}");
-                    value
-                }
+                set_chunk_overlay(value)?
             }
         };
 
@@ -227,18 +214,26 @@ impl Rag {
     }
 
     pub fn set_last_sources(&self, ids: &[DocumentId]) {
-        let sources: IndexSet<_> = ids
-            .iter()
-            .filter_map(|id| {
-                let (file_index, _) = split_document_id(*id);
-                let file = self.data.files.get(&file_index)?;
-                Some(file.path.clone())
-            })
-            .collect();
+        let mut sources: IndexMap<String, Vec<String>> = IndexMap::new();
+        for id in ids {
+            let (file_index, _) = id.split();
+            if let Some(file) = self.data.files.get(&file_index) {
+                sources
+                    .entry(file.path.clone())
+                    .or_default()
+                    .push(format!("{id:?}"));
+            }
+        }
         let sources = if sources.is_empty() {
             None
         } else {
-            Some(sources.into_iter().collect::<Vec<_>>().join("\n"))
+            Some(
+                sources
+                    .into_iter()
+                    .map(|(path, ids)| format!("{path} ({})", ids.join(",")))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
         };
         *self.last_sources.write() = sources;
     }
@@ -321,7 +316,7 @@ impl Rag {
             ret = self.hybird_search(text, top_k, min_score_vector_search, min_score_keyword_search, rerank_model) => {
                 ret
             }
-            _ = watch_abort_signal(abort_signal) => {
+            _ = wait_abort_signal(&abort_signal) => {
                 bail!("Aborted!")
             },
         };
@@ -394,14 +389,7 @@ impl Rag {
                 &separator,
             );
 
-            let metadata = metadata
-                .iter()
-                .map(|(k, v)| format!("{k}: {v}\n"))
-                .collect::<Vec<String>>()
-                .join("");
-            let split_options = SplitterChunkHeaderOptions::default().with_chunk_header(&format!(
-                "<document_metadata>\npath: {path}\n{metadata}</document_metadata>\n\n"
-            ));
+            let split_options = SplitterChunkHeaderOptions::default();
             let document = RagDocument::new(contents);
             let split_documents = splitter.split_documents(&[document], &split_options);
             rag_files.push(RagFile {
@@ -420,7 +408,7 @@ impl Rag {
             let mut texts = vec![];
             for file in rag_files.into_iter() {
                 for (document_index, document) in file.documents.iter().enumerate() {
-                    document_ids.push(combine_document_id(next_file_id, document_index));
+                    document_ids.push(DocumentId::new(next_file_id, document_index));
                     texts.push(document.page_content.clone())
                 }
                 files.push((next_file_id, file));
@@ -456,17 +444,21 @@ impl Rag {
         min_score_keyword_search: f32,
         rerank_model: Option<&str>,
     ) -> Result<Vec<(DocumentId, String)>> {
-        let (vector_search_result, text_search_result) = tokio::join!(
+        let (vector_search_results, keyword_search_results) = tokio::join!(
             self.vector_search(query, top_k, min_score_vector_search),
             self.keyword_search(query, top_k, min_score_keyword_search)
         );
-        let vector_search_ids = vector_search_result?;
-        let keyword_search_ids = text_search_result?;
-        debug!(
-            "vector_search_ids: {:?}, keyword_search_ids: {:?}",
-            pretty_document_ids(&vector_search_ids),
-            pretty_document_ids(&keyword_search_ids)
-        );
+
+        let vector_search_results = vector_search_results?;
+        debug!("vector_search_results: {vector_search_results:?}",);
+        let vector_search_ids: Vec<DocumentId> =
+            vector_search_results.into_iter().map(|(v, _)| v).collect();
+
+        let keyword_search_results = keyword_search_results?;
+        debug!("keyword_search_results: {keyword_search_results:?}",);
+        let keyword_search_ids: Vec<DocumentId> =
+            keyword_search_results.into_iter().map(|(v, _)| v).collect();
+
         let ids = match rerank_model {
             Some(model_id) => {
                 let model = Model::retrieve_reranker(&self.config.read(), model_id)?;
@@ -490,16 +482,16 @@ impl Rag {
                     .take(top_k)
                     .filter_map(|item| documents_ids.get(item.index).cloned())
                     .collect();
-                debug!("rerank_ids: {:?}", pretty_document_ids(&ids));
+                debug!("rerank_ids: {ids:?}");
                 ids
             }
             None => {
                 let ids = reciprocal_rank_fusion(
                     vec![vector_search_ids, keyword_search_ids],
-                    vec![1.0, 1.0],
+                    vec![1.125, 1.0],
                     top_k,
                 );
-                debug!("rrf_ids: {:?}", pretty_document_ids(&ids));
+                debug!("rrf_ids: {ids:?}");
                 ids
             }
         };
@@ -518,7 +510,7 @@ impl Rag {
         query: &str,
         top_k: usize,
         min_score: f32,
-    ) -> Result<Vec<DocumentId>> {
+    ) -> Result<Vec<(DocumentId, f32)>> {
         let splitter = RecursiveCharacterTextSplitter::new(
             self.data.chunk_size,
             self.data.chunk_overlap,
@@ -534,10 +526,12 @@ impl Rag {
             .flat_map(|list| {
                 list.into_iter()
                     .filter_map(|v| {
-                        if v.distance < min_score {
-                            return None;
+                        let score = 1.0 - v.distance;
+                        if score > min_score {
+                            Some((DocumentId(v.d_id), score))
+                        } else {
+                            None
                         }
-                        Some(v.d_id)
                     })
                     .collect::<Vec<_>>()
             })
@@ -550,8 +544,19 @@ impl Rag {
         query: &str,
         top_k: usize,
         min_score: f32,
-    ) -> Result<Vec<DocumentId>> {
-        let output = self.bm25.search(query, top_k, Some(min_score as f64));
+    ) -> Result<Vec<(DocumentId, f32)>> {
+        let results = self.bm25.search(query, top_k);
+        let output: Vec<(DocumentId, f32)> = results
+            .into_iter()
+            .filter_map(|v| {
+                let score = v.score;
+                if score > min_score {
+                    Some((v.document.id, score))
+                } else {
+                    None
+                }
+            })
+            .collect();
         Ok(output)
     }
 
@@ -670,7 +675,7 @@ impl RagData {
     }
 
     pub fn get(&self, id: DocumentId) -> Option<&RagDocument> {
-        let (file_index, document_index) = split_document_id(id);
+        let (file_index, document_index) = id.split();
         let file = self.files.get(&file_index)?;
         let document = file.documents.get(document_index)?;
         Some(document)
@@ -680,7 +685,7 @@ impl RagData {
         for file_id in file_ids {
             if let Some(file) = self.files.swap_remove(&file_id) {
                 for (document_index, _) in file.documents.iter().enumerate() {
-                    let document_id = combine_document_id(file_id, document_index);
+                    let document_id = DocumentId::new(file_id, document_index);
                     self.vectors.swap_remove(&document_id);
                 }
             }
@@ -702,20 +707,23 @@ impl RagData {
 
     pub fn build_hnsw(&self) -> Hnsw<'static, f32, DistCosine> {
         let hnsw = Hnsw::new(32, self.vectors.len(), 16, 200, DistCosine {});
-        let list: Vec<_> = self.vectors.iter().map(|(k, v)| (v, *k)).collect();
+        let list: Vec<_> = self.vectors.iter().map(|(k, v)| (v, k.0)).collect();
         hnsw.parallel_insert(&list);
         hnsw
     }
 
-    pub fn build_bm25(&self) -> BM25<DocumentId> {
-        let mut corpus = vec![];
+    pub fn build_bm25(&self) -> SearchEngine<DocumentId> {
+        let mut documents = vec![];
         for (file_index, file) in self.files.iter() {
             for (document_index, document) in file.documents.iter().enumerate() {
-                let id = combine_document_id(*file_index, document_index);
-                corpus.push((id, document.page_content.clone()));
+                let id = DocumentId::new(*file_index, document_index);
+                documents.push(bm25::Document::new(id, &document.page_content))
             }
         }
-        BM25::new(corpus, BM25Options::default())
+        SearchEngineBuilder::<DocumentId>::with_documents(Language::English, documents)
+            .k1(1.5)
+            .b(0.75)
+            .build()
     }
 }
 
@@ -753,26 +761,30 @@ impl Default for RagDocument {
 pub type RagMetadata = IndexMap<String, String>;
 
 pub type FileId = usize;
-pub type DocumentId = usize;
 
-pub fn combine_document_id(file_index: usize, document_index: usize) -> DocumentId {
-    file_index << (usize::BITS / 2) | document_index
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd)]
+pub struct DocumentId(usize);
+
+impl Debug for DocumentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (file_index, document_index) = self.split();
+        f.write_fmt(format_args!("{file_index}-{document_index}"))
+    }
 }
 
-pub fn split_document_id(value: DocumentId) -> (usize, usize) {
-    let low_mask = (1 << (usize::BITS / 2)) - 1;
-    let low = value & low_mask;
-    let high = value >> (usize::BITS / 2);
-    (high, low)
-}
+impl DocumentId {
+    pub fn new(file_index: usize, document_index: usize) -> Self {
+        let value = file_index << (usize::BITS / 2) | document_index;
+        Self(value)
+    }
 
-fn pretty_document_ids(ids: &[DocumentId]) -> Vec<String> {
-    ids.iter()
-        .map(|v| {
-            let (h, l) = split_document_id(*v);
-            format!("{h}-{l}")
-        })
-        .collect()
+    pub fn split(self) -> (usize, usize) {
+        let value = self.0;
+        let low_mask = (1 << (usize::BITS / 2)) - 1;
+        let low = value & low_mask;
+        let high = value >> (usize::BITS / 2);
+        (high, low)
+    }
 }
 
 fn select_embedding_model(models: &[&Model]) -> Result<String> {

@@ -42,6 +42,23 @@ pub async fn expand_glob_paths<T: AsRef<str>>(paths: &[T]) -> Result<Vec<String>
     Ok(new_paths)
 }
 
+pub fn list_file_names<T: AsRef<Path>>(dir: T, ext: &str) -> Vec<String> {
+    match std::fs::read_dir(dir.as_ref()) {
+        Ok(rd) => {
+            let mut names = vec![];
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                if let Some(name) = name.to_string_lossy().strip_suffix(ext) {
+                    names.push(name.to_string());
+                }
+            }
+            names.sort_unstable();
+            names
+        }
+        Err(_) => vec![],
+    }
+}
+
 pub fn get_patch_extension(path: &str) -> Option<String> {
     Path::new(&path)
         .extension()
@@ -82,7 +99,7 @@ async fn list_files(
     suffixes: Option<&Vec<String>>,
 ) -> Result<()> {
     if !entry_path.exists() {
-        bail!("Not found: {}", entry_path.display());
+        bail!("Not found '{}'", entry_path.display());
     }
     if entry_path.is_dir() {
         let mut reader = tokio::fs::read_dir(entry_path).await?;

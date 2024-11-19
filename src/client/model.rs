@@ -1,6 +1,7 @@
 use super::{
     list_chat_models, list_embedding_models, list_reranker_models,
-    message::{Message, MessageContent},
+    message::{Message, MessageContent, MessageContentPart},
+    MessageContentToolCalls,
 };
 
 use crate::config::Config;
@@ -183,6 +184,14 @@ impl Model {
         self.data.supports_vision
     }
 
+    pub fn no_stream(&self) -> bool {
+        self.data.no_stream
+    }
+
+    pub fn no_system_message(&self) -> bool {
+        self.data.no_system_message
+    }
+
     pub fn max_tokens_per_chunk(&self) -> Option<usize> {
         self.data.max_tokens_per_chunk
     }
@@ -221,8 +230,26 @@ impl Model {
             .iter()
             .map(|v| match &v.content {
                 MessageContent::Text(text) => estimate_token_length(text),
-                MessageContent::Array(_) => 0,
-                MessageContent::ToolResults(_) => 0,
+                MessageContent::Array(list) => list
+                    .iter()
+                    .map(|v| match v {
+                        MessageContentPart::Text { text } => estimate_token_length(text),
+                        MessageContentPart::ImageUrl { .. } => 0,
+                    })
+                    .sum(),
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results, text, ..
+                }) => {
+                    estimate_token_length(text)
+                        + tool_results
+                            .iter()
+                            .map(|v| {
+                                serde_json::to_string(v)
+                                    .map(|v| estimate_token_length(&v))
+                                    .unwrap_or_default()
+                            })
+                            .sum::<usize>()
+                }
             })
             .sum()
     }
@@ -268,6 +295,10 @@ pub struct ModelData {
     pub supports_vision: bool,
     #[serde(default)]
     pub supports_function_calling: bool,
+    #[serde(default)]
+    no_stream: bool,
+    #[serde(default)]
+    no_system_message: bool,
 
     // embedding-only properties
     pub max_tokens_per_chunk: Option<usize>,

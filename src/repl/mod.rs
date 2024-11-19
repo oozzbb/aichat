@@ -63,7 +63,7 @@ lazy_static::lazy_static! {
         ReplCommand::new(
             ".exit role",
             "Leave the role",
-            AssertState::True(StateFlags::ROLE),
+            AssertState::TrueFalse(StateFlags::ROLE, StateFlags::SESSION),
         ),
         ReplCommand::new(
             ".session",
@@ -106,6 +106,11 @@ lazy_static::lazy_static! {
             AssertState::False(StateFlags::AGENT)
         ),
         ReplCommand::new(
+            ".edit rag-docs",
+            "Edit the RAG documents",
+            AssertState::TrueFalse(StateFlags::RAG, StateFlags::AGENT),
+        ),
+        ReplCommand::new(
             ".rebuild rag",
             "Rebuild the RAG to sync document changes",
             AssertState::True(StateFlags::RAG),
@@ -134,12 +139,7 @@ lazy_static::lazy_static! {
         ReplCommand::new(
             ".variable",
             "Set agent variable",
-            AssertState::True(StateFlags::AGENT)
-        ),
-        ReplCommand::new(
-            ".save agent-config",
-            "Save the current agent config to file",
-            AssertState::True(StateFlags::AGENT)
+            AssertState::TrueFalse(StateFlags::AGENT, StateFlags::SESSION)
         ),
         ReplCommand::new(
             ".info agent",
@@ -162,9 +162,9 @@ lazy_static::lazy_static! {
             "Regenerate the last response",
             AssertState::pass()
         ),
+        ReplCommand::new(".copy", "Copy the last response", AssertState::pass()),
         ReplCommand::new(".set", "Adjust runtime configuration", AssertState::pass()),
         ReplCommand::new(".delete", "Delete roles/sessions/RAGs/agents", AssertState::pass()),
-        ReplCommand::new(".copy", "Copy the last response", AssertState::pass()),
         ReplCommand::new(".exit", "Exit the REPL", AssertState::pass()),
     ];
     static ref COMMAND_RE: Regex = Regex::new(r"^\s*(\.\S*)\s*").unwrap();
@@ -305,12 +305,17 @@ impl Repl {
                 ".rag" => {
                     Config::use_rag(&self.config, args, self.abort_signal.clone()).await?;
                 }
-                ".agent" => match args {
-                    Some(name) => {
-                        Config::use_agent(&self.config, name, None, self.abort_signal.clone())
-                            .await?;
+                ".agent" => match split_args(args) {
+                    Some((agent_name, session_name)) => {
+                        Config::use_agent(
+                            &self.config,
+                            agent_name,
+                            session_name,
+                            self.abort_signal.clone(),
+                        )
+                        .await?;
                     }
-                    None => println!(r#"Usage: .agent <name>"#),
+                    None => println!(r#"Usage: .agent <agent-name> [session-name]"#),
                 },
                 ".starter" => match args {
                     Some(value) => {
@@ -330,58 +335,43 @@ impl Repl {
                         println!("Usage: .variable <key> <value>")
                     }
                 },
-                ".save" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("role", name)) => {
-                            self.config.write().save_role(name)?;
-                        }
-                        Some(("session", name)) => {
-                            self.config.write().save_session(name)?;
-                        }
-                        Some(("agent-config", _)) => {
-                            self.config.write().save_agent_config()?;
-                        }
-                        _ => {
-                            println!(r#"Usage: .save <role|session|agent-config> [name]"#)
-                        }
+                ".save" => match split_args(args) {
+                    Some(("role", name)) => {
+                        self.config.write().save_role(name)?;
                     }
-                }
-                ".edit" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("role", _)) => {
-                            self.config.write().edit_role()?;
-                        }
-                        Some(("session", _)) => {
-                            self.config.write().edit_session()?;
-                        }
-                        _ => {
-                            println!(r#"Usage: .edit <role|session>"#)
-                        }
+                    Some(("session", name)) => {
+                        self.config.write().save_session(name)?;
                     }
-                }
-                ".compress" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("session", _)) => {
-                            let spinner = create_spinner("Compressing").await;
-                            let ret = Config::compress_session(&self.config).await;
-                            spinner.stop();
-                            ret?;
-                            println!("✨ Successfully compressed the session");
-                        }
-                        _ => {
-                            println!(r#"Usage: .compress session"#)
-                        }
+                    _ => {
+                        println!(r#"Usage: .save <role|session> [name]"#)
                     }
-                }
+                },
+                ".edit" => match args {
+                    Some("role") => {
+                        self.config.write().edit_role()?;
+                    }
+                    Some("session") => {
+                        self.config.write().edit_session()?;
+                    }
+                    Some("rag-docs") => {
+                        Config::edit_rag_docs(&self.config, self.abort_signal.clone()).await?;
+                    }
+                    _ => {
+                        println!(r#"Usage: .edit <role|session|rag-docs>"#)
+                    }
+                },
+                ".compress" => match args {
+                    Some("session") => {
+                        let spinner = create_spinner("Compressing").await;
+                        let ret = Config::compress_session(&self.config).await;
+                        spinner.stop();
+                        ret?;
+                        println!("✓ Successfully compressed the session.");
+                    }
+                    _ => {
+                        println!(r#"Usage: .compress session"#)
+                    }
+                },
                 ".empty" => match args {
                     Some("session") => {
                         self.config.write().empty_session()?;
@@ -390,33 +380,23 @@ impl Repl {
                         println!(r#"Usage: .empty session"#)
                     }
                 },
-                ".rebuild" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("rag", _)) => {
-                            Config::rebuild_rag(&self.config, self.abort_signal.clone()).await?;
-                        }
-                        _ => {
-                            println!(r#"Usage: .rebuild rag"#)
-                        }
+                ".rebuild" => match args {
+                    Some("rag") => {
+                        Config::rebuild_rag(&self.config, self.abort_signal.clone()).await?;
                     }
-                }
-                ".sources" => {
-                    match args.map(|v| match v.split_once(' ') {
-                        Some((subcmd, args)) => (subcmd, Some(args.trim())),
-                        None => (v, None),
-                    }) {
-                        Some(("rag", _)) => {
-                            let output = Config::rag_sources(&self.config)?;
-                            println!("{}", output);
-                        }
-                        _ => {
-                            println!(r#"Usage: .sources rag"#)
-                        }
+                    _ => {
+                        println!(r#"Usage: .rebuild rag"#)
                     }
-                }
+                },
+                ".sources" => match args {
+                    Some("rag") => {
+                        let output = Config::rag_sources(&self.config)?;
+                        println!("{}", output);
+                    }
+                    _ => {
+                        println!(r#"Usage: .sources rag"#)
+                    }
+                },
                 ".file" => match args {
                     Some(args) => {
                         let (files, text) = split_files_text(args);
@@ -455,7 +435,7 @@ impl Repl {
                         Config::delete(&self.config, args)?;
                     }
                     _ => {
-                        println!("Usage: .delete <roles|sessions|rags|agents>")
+                        println!("Usage: .delete <role|session|rag|agent-data>")
                     }
                 },
                 ".copy" => {
@@ -588,7 +568,7 @@ Type ".help" for additional help.
 
     fn copy(&self, text: &str) -> Result<()> {
         if text.is_empty() {
-            bail!("Empty text")
+            bail!("No text to copy")
         }
         set_text(text)?;
         Ok(())
@@ -657,11 +637,10 @@ async fn ask(
 
     let client = input.create_client()?;
     config.write().before_chat_completion(&input)?;
-    let (output, tool_results) = if config.read().stream {
-        call_chat_completions_streaming(&input, client.as_ref(), config, abort_signal.clone())
-            .await?
+    let (output, tool_results) = if input.stream() {
+        call_chat_completions_streaming(&input, client.as_ref(), abort_signal.clone()).await?
     } else {
-        call_chat_completions(&input, client.as_ref(), config).await?
+        call_chat_completions(&input, false, client.as_ref(), abort_signal.clone()).await?
     };
     config
         .write()
@@ -670,7 +649,7 @@ async fn ask(
         ask(
             config,
             abort_signal,
-            input.merge_tool_call(output, tool_results),
+            input.merge_tool_results(output, tool_results),
             false,
         )
         .await
@@ -724,6 +703,13 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
         }
         _ => None,
     }
+}
+
+fn split_args(args: Option<&str>) -> Option<(&str, Option<&str>)> {
+    args.map(|v| match v.split_once(' ') {
+        Some((subcmd, args)) => (subcmd, Some(args.trim())),
+        None => (v, None),
+    })
 }
 
 fn split_files_text(args: &str) -> (&str, &str) {

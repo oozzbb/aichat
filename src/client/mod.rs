@@ -6,7 +6,7 @@ mod macros;
 mod model;
 mod stream;
 
-pub use crate::function::{ToolCall, ToolResults};
+pub use crate::function::ToolCall;
 pub use crate::utils::PromptKind;
 pub use common::*;
 pub use message::*;
@@ -35,7 +35,7 @@ register_client!(
     (ernie, "ernie", ErnieConfig, ErnieClient),
 );
 
-pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 20] = [
+pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 21] = [
     ("ai21", "https://api.ai21.com/studio/v1"),
     ("cloudflare", ""),
     ("deepinfra", "https://api.deepinfra.com/v1/openai"),
@@ -43,7 +43,7 @@ pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 20] = [
     ("fireworks", "https://api.fireworks.ai/inference/v1"),
     ("github", "https://models.inference.ai.azure.com"),
     ("groq", "https://api.groq.com/openai/v1"),
-    ("huggingface", "https://api-inference.huggingface.co/v1"),
+    ("hunyuan", "https://api.hunyuan.cloud.tencent.com/v1"),
     ("lingyiwanwu", "https://api.lingyiwanwu.com/v1"),
     ("mistral", "https://api.mistral.ai/v1"),
     ("moonshot", "https://api.moonshot.cn/v1"),
@@ -56,6 +56,7 @@ pub const OPENAI_COMPATIBLE_PLATFORMS: [(&str, &str); 20] = [
     ),
     ("siliconflow", "https://api.siliconflow.cn/v1"),
     ("together", "https://api.together.xyz/v1"),
+    ("xai", "https://api.x.ai/v1"),
     ("zhipuai", "https://open.bigmodel.cn/api/paas/v4"),
     // RAG-dedicated
     ("jina", "https://api.jina.ai/v1"),

@@ -309,12 +309,7 @@ pub fn gemini_build_chat_completions_body(
         stream: _,
     } = data;
 
-    let system_message = if model.name().starts_with("gemini-1.5-") {
-        extract_system_message(&mut messages)
-    } else {
-        patch_system_message(&mut messages);
-        None
-    };
+    let system_message = extract_system_message(&mut messages);
 
     let mut network_image_urls = vec![];
     let contents: Vec<Value> = messages
@@ -347,7 +342,7 @@ pub fn gemini_build_chat_completions_body(
                             .collect();
                         vec![json!({ "role": role, "parts": parts })]
                     },
-                    MessageContent::ToolResults((tool_results, _)) => {
+                    MessageContent::ToolCalls(MessageContentToolCalls { tool_results, .. }) => {
                         let model_parts: Vec<Value> = tool_results.iter().map(|tool_result| {
                             json!({
                                 "functionCall": {

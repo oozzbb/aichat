@@ -27,12 +27,15 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     compress_threshold: Option<usize>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_name: Option<String>,
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    agent_variables: IndexMap<String, String>,
+
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     data_urls: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     compressed_messages: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    role_name: Option<String>,
 
     messages: Vec<Message>,
 
@@ -46,6 +49,8 @@ pub struct Session {
     path: Option<String>,
     #[serde(skip)]
     dirty: bool,
+    #[serde(skip)]
+    append_conversation: bool,
     #[serde(skip)]
     compressing: bool,
 }
@@ -79,10 +84,6 @@ impl Session {
             }
         }
 
-        if let Some(agent) = &config.agent {
-            session.set_agent(agent);
-        }
-
         Ok(session)
     }
 
@@ -92,6 +93,10 @@ impl Session {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn role_name(&self) -> Option<&str> {
+        self.role_name.as_deref()
     }
 
     pub fn dirty(&self) -> bool {
@@ -155,7 +160,11 @@ impl Session {
         Ok(output)
     }
 
-    pub fn render(&self, render: &mut MarkdownRender) -> Result<String> {
+    pub fn render(
+        &self,
+        render: &mut MarkdownRender,
+        agent_info: &Option<(String, Vec<String>)>,
+    ) -> Result<String> {
         let mut items = vec![];
 
         if let Some(path) = &self.path {
@@ -200,7 +209,10 @@ impl Session {
             for message in &self.messages {
                 match message.role {
                     MessageRole::System => {
-                        lines.push(render.render(&message.content.render_input(resolve_url_fn)));
+                        lines.push(
+                            render
+                                .render(&message.content.render_input(resolve_url_fn, agent_info)),
+                        );
                     }
                     MessageRole::Assistant => {
                         if let MessageContent::Text(text) = &message.content {
@@ -212,8 +224,11 @@ impl Session {
                         lines.push(format!(
                             "{}）{}",
                             self.name,
-                            message.content.render_input(resolve_url_fn)
+                            message.content.render_input(resolve_url_fn, agent_info)
                         ));
+                    }
+                    MessageRole::Tool => {
+                        lines.push(message.content.render_input(resolve_url_fn, agent_info));
                     }
                 }
             }
@@ -240,19 +255,27 @@ impl Session {
         self.top_p = role.top_p();
         self.use_tools = role.use_tools();
         self.model = role.model().clone();
-        self.role_name = Some(role.name().to_string());
+        self.role_name = convert_option_string(role.name());
         self.role_prompt = role.prompt().to_string();
         self.dirty = true;
-    }
-
-    pub fn set_agent(&mut self, agent: &Agent) {
-        self.role_prompt
-            .clone_from(&agent.definition().instructions);
     }
 
     pub fn clear_role(&mut self) {
         self.role_name = None;
         self.role_prompt.clear();
+    }
+
+    pub fn sync_agent(&mut self, agent: &Agent, set_dirty: bool) {
+        self.role_name = None;
+        self.role_prompt = agent.interpolated_instructions();
+        self.agent_variables = agent.variables().clone();
+        if set_dirty {
+            self.dirty = true;
+        }
+    }
+
+    pub fn agent_variables(&self) -> &IndexMap<String, String> {
+        &self.agent_variables
     }
 
     pub fn set_save_session(&mut self, value: Option<bool>) {
@@ -263,6 +286,10 @@ impl Session {
             self.save_session = value;
             self.dirty = true;
         }
+    }
+
+    pub fn set_append_conversation(&mut self) {
+        self.append_conversation = true;
     }
 
     pub fn set_compress_threshold(&mut self, value: Option<usize>) {
@@ -297,7 +324,10 @@ impl Session {
     }
 
     pub fn exit(&mut self, session_dir: &Path, is_repl: bool) -> Result<()> {
-        let save_session = self.save_session();
+        let mut save_session = self.save_session();
+        if self.append_conversation {
+            save_session = Some(true);
+        }
         if self.dirty && save_session != Some(false) {
             let mut session_name = self.name().to_string();
             if save_session.is_none() {
@@ -349,7 +379,7 @@ impl Session {
         })?;
 
         if is_repl {
-            println!("✨ Saved session to '{}'", session_path.display());
+            println!("✓ Saved session to '{}'.", session_path.display());
         }
 
         if self.name() != session_name {
@@ -363,7 +393,7 @@ impl Session {
 
     pub fn guard_empty(&self) -> Result<()> {
         if !self.is_empty() {
-            bail!("This action cannot be performed in a session with messages.")
+            bail!("Cannot perform this operation because the session has messages, please `.empty session` first.");
         }
         Ok(())
     }
@@ -389,6 +419,12 @@ impl Session {
                     .push(Message::new(MessageRole::User, input.message_content()));
             }
             self.data_urls.extend(input.data_urls());
+            if let Some(tool_calls) = input.tool_calls() {
+                self.messages.push(Message::new(
+                    MessageRole::Tool,
+                    MessageContent::ToolCalls(tool_calls.clone()),
+                ))
+            }
             self.messages.push(Message::new(
                 MessageRole::Assistant,
                 MessageContent::Text(output.to_string()),
