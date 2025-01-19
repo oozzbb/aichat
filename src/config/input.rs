@@ -8,7 +8,6 @@ use crate::function::ToolResult;
 use crate::utils::{base64_encode, sha256, AbortSignal};
 
 use anyhow::{bail, Context, Result};
-use fancy_regex::Regex;
 use path_absolutize::Absolutize;
 use std::{collections::HashMap, fs::File, io::Read, path::Path};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -16,23 +15,20 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
 
-lazy_static::lazy_static! {
-    static ref URL_RE: Regex = Regex::new(r"^[A-Za-z0-9_-]{2,}:/").unwrap();
-}
-
 #[derive(Debug, Clone)]
 pub struct Input {
     config: GlobalConfig,
     text: String,
     raw: (String, Vec<String>),
     patched_text: Option<String>,
+    last_reply: Option<String>,
     continue_output: Option<String>,
     regenerate: bool,
     medias: Vec<String>,
     data_urls: HashMap<String, String>,
     tool_calls: Option<MessageContentToolCalls>,
-    rag_name: Option<String>,
     role: Role,
+    rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
 }
@@ -45,13 +41,14 @@ impl Input {
             text: text.to_string(),
             raw: (text.to_string(), vec![]),
             patched_text: None,
+            last_reply: None,
             continue_output: None,
             regenerate: false,
             medias: Default::default(),
             data_urls: Default::default(),
             tool_calls: None,
-            rag_name: None,
             role,
+            rag_name: None,
             with_session,
             with_agent,
         }
@@ -63,17 +60,27 @@ impl Input {
         paths: Vec<String>,
         role: Option<Role>,
     ) -> Result<Self> {
-        let spinner = create_spinner("Loading files").await;
         let mut raw_paths = vec![];
+        let mut external_cmds = vec![];
         let mut local_paths = vec![];
         let mut remote_urls = vec![];
+        let mut last_reply = None;
+        let mut with_last_reply = false;
         for path in paths {
             match resolve_local_path(&path) {
                 Some(v) => {
-                    if let Ok(path) = Path::new(&v).absolutize() {
-                        raw_paths.push(path.display().to_string());
+                    if v == "%%" {
+                        with_last_reply = true;
+                        raw_paths.push(v);
+                    } else if v.len() > 2 && v.starts_with('`') && v.ends_with('`') {
+                        external_cmds.push(v[1..v.len() - 1].to_string());
+                        raw_paths.push(v);
+                    } else {
+                        if let Ok(path) = Path::new(&v).absolutize() {
+                            raw_paths.push(path.display().to_string());
+                        }
+                        local_paths.push(v);
                     }
-                    local_paths.push(v);
                 }
                 None => {
                     raw_paths.push(path.clone());
@@ -81,18 +88,33 @@ impl Input {
                 }
             }
         }
-        let ret = load_documents(config, local_paths, remote_urls).await;
-        spinner.stop();
-        let (files, medias, data_urls) = ret.context("Failed to load files")?;
+        let (files, medias, data_urls) =
+            load_documents(config, external_cmds, local_paths, remote_urls)
+                .await
+                .context("Failed to load files")?;
         let mut texts = vec![];
         if !raw_text.is_empty() {
             texts.push(raw_text.to_string());
         };
-        if !files.is_empty() {
-            texts.push(String::new());
+        if with_last_reply {
+            if let Some(LastMessage { input, output, .. }) = config.read().last_message.as_ref() {
+                if !output.is_empty() {
+                    last_reply = Some(output.clone())
+                } else if let Some(v) = input.last_reply.as_ref() {
+                    last_reply = Some(v.clone());
+                }
+                if let Some(v) = last_reply.clone() {
+                    texts.push(format!("\n{v}\n"));
+                }
+            }
+            if last_reply.is_none() && files.is_empty() && medias.is_empty() {
+                bail!("No last reply found");
+            }
         }
-        for (path, contents) in files {
-            texts.push(format!("`{path}`:\n\n{contents}\n"));
+        for (kind, path, contents) in files {
+            texts.push(format!(
+                "\n============ {kind}: {path} ============\n{contents}"
+            ));
         }
         let (role, with_session, with_agent) = resolve_role(&config.read(), role);
         Ok(Self {
@@ -100,16 +122,32 @@ impl Input {
             text: texts.join("\n"),
             raw: (raw_text.to_string(), raw_paths),
             patched_text: None,
+            last_reply,
             continue_output: None,
             regenerate: false,
             medias,
             data_urls,
             tool_calls: Default::default(),
-            rag_name: None,
             role,
+            rag_name: None,
             with_session,
             with_agent,
         })
+    }
+
+    pub async fn from_files_with_spinner(
+        config: &GlobalConfig,
+        raw_text: &str,
+        paths: Vec<String>,
+        role: Option<Role>,
+        abort_signal: AbortSignal,
+    ) -> Result<Self> {
+        abortable_run_with_spinner(
+            Input::from_files(config, raw_text, paths, role),
+            "Loading files",
+            abort_signal,
+        )
+        .await
     }
 
     pub fn is_empty(&self) -> bool {
@@ -364,26 +402,43 @@ fn resolve_role(config: &Config, role: Option<Role>) -> (Role, bool, bool) {
 
 async fn load_documents(
     config: &GlobalConfig,
+    external_cmds: Vec<String>,
     local_paths: Vec<String>,
     remote_urls: Vec<String>,
-) -> Result<(Vec<(String, String)>, Vec<String>, HashMap<String, String>)> {
+) -> Result<(
+    Vec<(&'static str, String, String)>,
+    Vec<String>,
+    HashMap<String, String>,
+)> {
     let mut files = vec![];
     let mut medias = vec![];
     let mut data_urls = HashMap::new();
+    for cmd in external_cmds {
+        let (success, stdout, stderr) =
+            run_command_with_output(&SHELL.cmd, &[&SHELL.arg, &cmd], None)?;
+        if !success {
+            let err = if !stderr.is_empty() { stderr } else { stdout };
+            bail!("Failed to run `{cmd}`\n{err}");
+        }
+        files.push(("CMD", cmd, stdout));
+    }
+
+    let local_files = expand_glob_paths(&local_paths, true).await?;
     let loaders = config.read().document_loaders.clone();
-    let local_files = expand_glob_paths(&local_paths).await?;
     for file_path in local_files {
         if is_image(&file_path) {
-            let data_url = read_media_to_data_url(&file_path)
+            let contents = read_media_to_data_url(&file_path)
                 .with_context(|| format!("Unable to read media file '{file_path}'"))?;
-            data_urls.insert(sha256(&data_url), file_path);
-            medias.push(data_url)
+            data_urls.insert(sha256(&contents), file_path);
+            medias.push(contents)
         } else {
-            let text = read_file(&file_path)
+            let document = load_file(&loaders, &file_path)
+                .await
                 .with_context(|| format!("Unable to read file '{file_path}'"))?;
-            files.push((file_path, text));
+            files.push(("FILE", file_path, document.contents));
         }
     }
+
     for file_url in remote_urls {
         let (contents, extension) = fetch(&loaders, &file_url, true)
             .await
@@ -392,7 +447,7 @@ async fn load_documents(
             data_urls.insert(sha256(&contents), file_url);
             medias.push(contents)
         } else {
-            files.push((file_url, contents));
+            files.push(("URL", file_url, contents));
         }
     }
     Ok((files, medias, data_urls))
@@ -411,7 +466,7 @@ pub fn resolve_data_url(data_urls: &HashMap<String, String>, data_url: String) -
 }
 
 fn resolve_local_path(path: &str) -> Option<String> {
-    if let Ok(true) = URL_RE.is_match(path) {
+    if is_url(path) {
         return None;
     }
     let new_path = if let (Some(file), Some(home)) = (path.strip_prefix("~/"), dirs::home_dir()) {
@@ -445,13 +500,4 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
     let data_url = format!("data:{};base64,{}", mime_type, encoded_image);
 
     Ok(data_url)
-}
-
-fn read_file<P: AsRef<Path>>(file_path: P) -> Result<String> {
-    let file_path = file_path.as_ref();
-
-    let mut text = String::new();
-    let mut file = File::open(file_path)?;
-    file.read_to_string(&mut text)?;
-    Ok(text)
 }

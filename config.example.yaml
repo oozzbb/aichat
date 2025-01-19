@@ -1,7 +1,7 @@
 # ---- llm ----
 model: openai:gpt-4o             # Specify the LLM to use
-temperature: null                # Set default temperature parameter
-top_p: null                      # Set default top-p parameter, range (0, 1)
+temperature: null                # Set default temperature parameter (0, 1)
+top_p: null                      # Set default top-p parameter, with a range of (0, 1) or (0, 2) depending on the model
 
 # ---- behavior ----
 stream: true                     # Controls whether to use the stream-style API.
@@ -35,13 +35,11 @@ summary_prompt: 'This is a summary of the chat history as a recap: '
 
 # ---- RAG ----
 # See [RAG-Guide](https://github.com/sigoden/aichat/wiki/RAG-Guide) for more details.
-rag_embedding_model: null                   # Specifies the embedding model to use
-rag_reranker_model: null                    # Specifies the rerank model to use
-rag_top_k: 5                                # Specifies the number of documents to retrieve
-rag_chunk_size: null                        # Specifies the chunk size
-rag_chunk_overlap: null                     # Specifies the chunk overlap
-rag_min_score_vector_search: 0              # Specifies the minimum relevance score for vector-based searching
-rag_min_score_keyword_search: 0             # Specifies the minimum relevance score for keyword-based searching
+rag_embedding_model: null        # Specifies the embedding model used for context retrieval
+rag_reranker_model: null         # Specifies the reranker model used for sorting retrieved documents
+rag_top_k: 5                     # Specifies the number of documents to retrieve for answering queries
+rag_chunk_size: null             # Defines the size of chunks for document processing in characters
+rag_chunk_overlap: null          # Defines the overlap between chunks
 # Defines the query structure using variables like __CONTEXT__ and __INPUT__ to tailor searches to specific needs
 rag_template: |
   Answer the query based on the context while respecting the rules. (user query, some textual context and rules, all inside xml tags)
@@ -83,6 +81,7 @@ right_prompt:
 # ---- misc ----
 serve_addr: 127.0.0.1:8000                  # Default serve listening address 
 user_agent: null                            # Set User-Agent HTTP header, use `auto` for aichat/<current-version>
+save_shell_history: true                    # Whether to save shell execution command to the history file
 
 # ---- clients ----
 clients:
@@ -180,7 +179,7 @@ clients:
 
   # See https://docs.cohere.com/docs/the-cohere-platform
   - type: cohere
-    api_base: https://api.cohere.ai/v1                # Optional
+    api_base: https://api.cohere.ai/v2                # Optional
     api_key: xxx
 
   # See https://docs.perplexity.ai/docs/getting-started
@@ -283,6 +282,12 @@ clients:
   - type: openai-compatible
     name: lingyiwanwu
     api_base: https://api.lingyiwanwu.com/v1
+    api_key: xxx
+
+  # See https://platform.minimaxi.com/document/Fast%20access
+  - type: openai-compatible
+    name: minimax
+    api_base: https://api.minimax.chat/v1
     api_key: xxx
 
   # See https://deepinfra.com/docs

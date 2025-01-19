@@ -3,6 +3,7 @@ mod clipboard;
 mod command;
 mod crypto;
 mod html_to_md;
+mod loader;
 mod path;
 mod prompt_input;
 mod render_prompt;
@@ -15,6 +16,7 @@ pub use self::clipboard::set_text;
 pub use self::command::*;
 pub use self::crypto::*;
 pub use self::html_to_md::*;
+pub use self::loader::*;
 pub use self::path::*;
 pub use self::prompt_input::*;
 pub use self::render_prompt::render_prompt;
@@ -35,8 +37,11 @@ lazy_static::lazy_static! {
 }
 
 pub fn now() -> String {
-    let now = chrono::Local::now();
-    now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+pub fn now_timestamp() -> i64 {
+    chrono::Local::now().timestamp()
 }
 
 pub fn get_env_name(key: &str) -> String {
@@ -104,16 +109,6 @@ pub fn extract_block(input: &str) -> String {
         input.trim().to_string()
     } else {
         output.trim().to_string()
-    }
-}
-
-pub fn format_option_value<T>(value: &Option<T>) -> String
-where
-    T: std::fmt::Display,
-{
-    match value {
-        Some(value) => value.to_string(),
-        None => "-".to_string(),
     }
 }
 
@@ -194,6 +189,21 @@ pub fn dimmed_text(input: &str) -> String {
     nu_ansi_term::Style::new().dimmed().paint(input).to_string()
 }
 
+pub fn multiline_text(input: &str) -> String {
+    input
+        .split('\n')
+        .enumerate()
+        .map(|(i, v)| {
+            if i == 0 {
+                v.to_string()
+            } else {
+                format!(".. {v}")
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
 pub fn temp_file(prefix: &str, suffix: &str) -> PathBuf {
     env::temp_dir().join(format!(
         "{}-{}{prefix}{}{suffix}",
@@ -208,24 +218,17 @@ pub fn is_url(path: &str) -> bool {
 }
 
 pub fn set_proxy(
-    builder: reqwest::ClientBuilder,
+    mut builder: reqwest::ClientBuilder,
     proxy: Option<&String>,
 ) -> Result<reqwest::ClientBuilder> {
-    let proxy = if let Some(proxy) = proxy {
-        if proxy.is_empty() || proxy == "-" {
-            return Ok(builder);
+    if let Some(proxy) = proxy {
+        builder = builder.no_proxy();
+        if !proxy.is_empty() && proxy != "-" {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?,
+            );
         }
-        proxy.clone()
-    } else if let Some(proxy) = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
-        .into_iter()
-        .find_map(|v| env::var(v).ok())
-    {
-        proxy
-    } else {
-        return Ok(builder);
     };
-    let builder = builder
-        .proxy(reqwest::Proxy::all(&proxy).with_context(|| format!("Invalid proxy `{proxy}`"))?);
     Ok(builder)
 }
 

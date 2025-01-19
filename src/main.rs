@@ -13,12 +13,13 @@ mod utils;
 extern crate log;
 
 use crate::cli::Cli;
-use crate::client::{call_chat_completions, call_chat_completions_streaming, list_chat_models};
-use crate::config::{
-    ensure_parent_exists, list_agents, load_env_file, Config, GlobalConfig, Input, WorkingMode,
-    CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
+use crate::client::{
+    call_chat_completions, call_chat_completions_streaming, list_models, ModelType,
 };
-use crate::function::need_send_tool_results;
+use crate::config::{
+    ensure_parent_exists, list_agents, load_env_file, macro_execute, Config, GlobalConfig, Input,
+    WorkingMode, CODE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE, TEMP_SESSION_NAME,
+};
 use crate::render::render_error;
 use crate::repl::Repl;
 use crate::utils::*;
@@ -30,19 +31,13 @@ use inquire::Text;
 use is_terminal::IsTerminal;
 use parking_lot::RwLock;
 use simplelog::{format_description, ConfigBuilder, LevelFilter, SimpleLogger, WriteLogger};
-use std::{
-    env,
-    io::{stdin, Read},
-    process,
-    sync::Arc,
-};
+use std::{env, io::stdin, process, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     load_env_file()?;
     let cli = Cli::parse();
-    let text = cli.text();
-    let text = aggregate_text(text)?;
+    let text = cli.text()?;
     let working_mode = if cli.serve.is_some() {
         WorkingMode::Serve
     } else if text.is_none() && cli.file.is_empty() {
@@ -50,8 +45,15 @@ async fn main() -> Result<()> {
     } else {
         WorkingMode::Cmd
     };
+    let info_flag = cli.info
+        || cli.list_models
+        || cli.list_roles
+        || cli.list_agents
+        || cli.list_rags
+        || cli.list_macros
+        || cli.list_sessions;
     setup_logger(working_mode.is_serve())?;
-    let config = Arc::new(RwLock::new(Config::init(working_mode)?));
+    let config = Arc::new(RwLock::new(Config::init(working_mode, info_flag)?));
     if let Err(err) = run(config, cli, text).await {
         render_error(err);
         std::process::exit(1);
@@ -62,15 +64,8 @@ async fn main() -> Result<()> {
 async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()> {
     let abort_signal = create_abort_signal();
 
-    if let Some(addr) = cli.serve {
-        return serve::run(config, addr).await;
-    }
-    if cli.info {
-        config.write().print_info_only = true;
-    }
-
     if cli.list_models {
-        for model in list_chat_models(&config.read()) {
+        for model in list_models(&config.read(), ModelType::Chat) {
             println!("{}", model.id());
         }
         return Ok(());
@@ -90,6 +85,12 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         println!("{rags}");
         return Ok(());
     }
+    if cli.list_macros {
+        let macros = Config::list_macros().join("\n");
+        println!("{macros}");
+        return Ok(());
+    }
+
     if cli.dry_run {
         config.write().dry_run = true;
     }
@@ -99,7 +100,18 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
             Some(v) => v.as_str(),
             None => TEMP_SESSION_NAME,
         });
-        Config::use_agent(&config, agent, session, abort_signal.clone()).await?
+        if !cli.agent_variable.is_empty() {
+            config.write().agent_variables = Some(
+                cli.agent_variable
+                    .chunks(2)
+                    .map(|v| (v[0].to_string(), v[1].to_string()))
+                    .collect(),
+            );
+        }
+
+        let ret = Config::use_agent(&config, agent, session, abort_signal.clone()).await;
+        config.write().agent_variables = None;
+        ret?;
     } else {
         if let Some(prompt) = &cli.prompt {
             config.write().use_prompt(prompt)?;
@@ -141,19 +153,32 @@ async fn run(config: GlobalConfig, cli: Cli, text: Option<String>) -> Result<()>
         println!("{}", info);
         return Ok(());
     }
+    if let Some(addr) = cli.serve {
+        return serve::run(config, addr).await;
+    }
     let is_repl = config.read().working_mode.is_repl();
+    if cli.rebuild_rag {
+        Config::rebuild_rag(&config, abort_signal.clone()).await?;
+        if is_repl {
+            return Ok(());
+        }
+    }
+    if let Some(name) = &cli.macro_name {
+        macro_execute(&config, name, text.as_deref(), abort_signal.clone()).await?;
+        return Ok(());
+    }
     if cli.execute && !is_repl {
         if cfg!(target_os = "macos") && !stdin().is_terminal() {
             bail!("Unable to read the pipe for shell execution on MacOS")
         }
-        let input = create_input(&config, text, &cli.file).await?;
+        let input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
         shell_execute(&config, &SHELL, input, abort_signal.clone()).await?;
         return Ok(());
     }
     config.write().apply_prelude()?;
     match is_repl {
         false => {
-            let mut input = create_input(&config, text, &cli.file).await?;
+            let mut input = create_input(&config, text, &cli.file, abort_signal.clone()).await?;
             input.use_embeddings(abort_signal.clone()).await?;
             start_directive(&config, input, cli.code, abort_signal).await
         }
@@ -185,7 +210,7 @@ async fn start_directive(
         .write()
         .after_chat_completion(&input, &output, &tool_results)?;
 
-    if need_send_tool_results(&tool_results) {
+    if !tool_results.is_empty() {
         start_directive(
             config,
             input.merge_tool_results(output, tool_results),
@@ -260,9 +285,10 @@ async fn shell_execute(
                 "e" => {
                     debug!("{} {:?}", shell.cmd, &[&shell.arg, &eval_str]);
                     let code = run_command(&shell.cmd, &[&shell.arg, &eval_str], None)?;
-                    if code != 0 {
-                        process::exit(code);
+                    if code == 0 && config.read().save_shell_history {
+                        let _ = append_to_shell_history(&shell.name, &eval_str, code);
                     }
+                    process::exit(code);
                 }
                 "r" => {
                     let revision = Text::new("Enter your revision:").prompt()?;
@@ -301,30 +327,23 @@ async fn shell_execute(
     Ok(())
 }
 
-fn aggregate_text(text: Option<String>) -> Result<Option<String>> {
-    let text = if stdin().is_terminal() {
-        text
-    } else {
-        let mut stdin_text = String::new();
-        stdin().read_to_string(&mut stdin_text)?;
-        if let Some(text) = text {
-            Some(format!("{text}\n{stdin_text}"))
-        } else {
-            Some(stdin_text)
-        }
-    };
-    Ok(text)
-}
-
 async fn create_input(
     config: &GlobalConfig,
     text: Option<String>,
     file: &[String],
+    abort_signal: AbortSignal,
 ) -> Result<Input> {
     let input = if file.is_empty() {
         Input::from_str(config, &text.unwrap_or_default(), None)
     } else {
-        Input::from_files(config, &text.unwrap_or_default(), file.to_vec(), None).await?
+        Input::from_files_with_spinner(
+            config,
+            &text.unwrap_or_default(),
+            file.to_vec(),
+            None,
+            abort_signal,
+        )
+        .await?
     };
     if input.is_empty() {
         bail!("No input");
