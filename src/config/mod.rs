@@ -3,7 +3,7 @@ mod input;
 mod role;
 mod session;
 
-pub use self::agent::{list_agents, Agent, AgentDefinition, AgentVariables};
+pub use self::agent::{complete_agent_variables, list_agents, Agent, AgentVariables};
 pub use self::input::Input;
 pub use self::role::{
     Role, RoleLike, CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, SHELL_ROLE,
@@ -472,6 +472,18 @@ impl Config {
             },
         };
         Ok((log_level, log_path))
+    }
+
+    pub fn edit_config(&self) -> Result<()> {
+        let config_path = Self::config_file();
+        let editor = self.editor()?;
+        edit_file(&editor, &config_path)?;
+        println!(
+            "NOTE: Remember to restart {} if there are changes made to '{}",
+            env!("CARGO_CRATE_NAME"),
+            config_path.display(),
+        );
+        Ok(())
     }
 
     pub fn current_model(&self) -> &Model {
@@ -953,6 +965,9 @@ impl Config {
         ensure_parent_exists(&role_path)?;
         let editor = self.editor()?;
         edit_file(&editor, &role_path)?;
+        if self.working_mode.is_repl() {
+            println!("✓ Saved the role to '{}'.", role_path.display());
+        }
         Ok(())
     }
 
@@ -1508,6 +1523,34 @@ impl Config {
         }
     }
 
+    pub fn edit_agent_config(&self) -> Result<()> {
+        let agent_name = match &self.agent {
+            Some(agent) => agent.name(),
+            None => bail!("No agent"),
+        };
+        let agent_config_path = Config::agent_config_file(agent_name);
+        ensure_parent_exists(&agent_config_path)?;
+        if !agent_config_path.exists() {
+            std::fs::write(
+                &agent_config_path,
+                "# see https://github.com/sigoden/aichat/blob/main/config.agent.example.yaml\n",
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to write to agent config file at '{}'",
+                    agent_config_path.display()
+                )
+            })?;
+        }
+        let editor = self.editor()?;
+        edit_file(&editor, &agent_config_path)?;
+        println!(
+            "NOTE: Remember to reload the agent if there are changes made to '{}'",
+            agent_config_path.display()
+        );
+        Ok(())
+    }
+
     pub fn exit_agent(&mut self) -> Result<()> {
         self.exit_session()?;
         if self.agent.take().is_some() {
@@ -1696,7 +1739,7 @@ impl Config {
         _line: &str,
     ) -> Vec<(String, Option<String>)> {
         let mut values: Vec<(String, Option<String>)> = vec![];
-        let mut filter = "";
+        let filter = args.last().unwrap_or(&"");
         if args.len() == 1 {
             values = match cmd {
                 ".role" => map_completion_values(Self::list_roles(true)),
@@ -1756,7 +1799,6 @@ impl Config {
                 }
                 _ => vec![],
             };
-            filter = args[0]
         } else if cmd == ".set" && args.len() == 2 {
             let candidates = match args[0] {
                 "max_output_tokens" => match self.model.max_output_tokens() {
@@ -1802,7 +1844,6 @@ impl Config {
                 _ => vec![],
             };
             values = candidates.into_iter().map(|v| (v, None)).collect();
-            filter = args[1];
         } else if cmd == ".agent" {
             if args.len() == 2 {
                 let dir = Self::agent_data_dir(args[0]).join(SESSIONS_DIR_NAME);
@@ -1811,17 +1852,7 @@ impl Config {
                     .map(|v| (v, None))
                     .collect();
             }
-            let definition_file_path = Self::agent_functions_dir(args[0]).join("index.yaml");
-            if definition_file_path.exists() {
-                if let Ok(definition) = AgentDefinition::load(&definition_file_path) {
-                    values.extend(
-                        definition
-                            .variables
-                            .iter()
-                            .map(|v| (format!("{}=", v.name), Some(v.description.clone()))),
-                    );
-                }
-            }
+            values.extend(complete_agent_variables(args[0]));
         };
         values
             .into_iter()
@@ -2550,7 +2581,12 @@ fn create_config_file(config_path: &Path) -> Result<()> {
     );
 
     ensure_parent_exists(config_path)?;
-    std::fs::write(config_path, config_data).with_context(|| "Failed to write to config file")?;
+    std::fs::write(config_path, config_data).with_context(|| {
+        format!(
+            "Failed to write to config file at '{}'",
+            config_path.display()
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::prelude::PermissionsExt;
@@ -2558,7 +2594,7 @@ fn create_config_file(config_path: &Path) -> Result<()> {
         std::fs::set_permissions(config_path, perms)?;
     }
 
-    println!("✓ Saved config file to '{}'.\n", config_path.display());
+    println!("✓ Saved the config file to '{}'.\n", config_path.display());
 
     Ok(())
 }
