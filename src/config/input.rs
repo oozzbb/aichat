@@ -249,9 +249,6 @@ impl Input {
         model: &Model,
         stream: bool,
     ) -> Result<ChatCompletionsData> {
-        if !self.medias.is_empty() && !model.supports_vision() {
-            bail!("The current model does not support vision. Is the model configured with `supports_vision: true`?");
-        }
         let mut messages = self.build_messages()?;
         if model.no_system_message() {
             patch_system_message(&mut messages);
@@ -445,7 +442,7 @@ async fn load_documents(
     }
 
     for file_url in remote_urls {
-        let (contents, extension) = fetch(&loaders, &file_url, true)
+        let (contents, extension) = fetch_with_loaders(&loaders, &file_url, true)
             .await
             .with_context(|| format!("Failed to load url '{file_url}'"))?;
         if extension == MEDIA_URL_EXTENSION {
