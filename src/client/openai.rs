@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::utils::strip_think_tag;
+
 use anyhow::{bail, Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
@@ -219,9 +221,11 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
         stream,
     } = data;
 
+    let messages_len = messages.len();
     let messages: Vec<Value> = messages
         .into_iter()
-        .flat_map(|message| {
+        .enumerate()
+        .flat_map(|(i, message)| {
             let Message { role, content } = message;
             match content {
                 MessageContent::ToolCalls(MessageContentToolCalls {
@@ -281,18 +285,24 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
                         }).collect()
                     }
                 },
+                MessageContent::Text(text) if role.is_assistant() && i != messages_len - 1 => vec![
+                    json!({ "role": role, "content": strip_think_tag(&text) }
+                )],
                 _ => vec![json!({ "role": role, "content": content })]
             }
         })
         .collect();
 
     let mut body = json!({
-        "model": &model.name(),
+        "model": &model.real_name(),
         "messages": messages,
     });
 
     if let Some(v) = model.max_tokens_param() {
         body["max_tokens"] = v.into();
+    }
+    if model.client_name().starts_with("openrouter") && model.supports_reasoning() {
+        body["include_reasoning"] = true.into();
     }
     if let Some(v) = temperature {
         body["temperature"] = v.into();
@@ -320,7 +330,7 @@ pub fn openai_build_chat_completions_body(data: ChatCompletionsData, model: &Mod
 pub fn openai_build_embeddings_body(data: &EmbeddingsData, model: &Model) -> Value {
     json!({
         "input": data.texts,
-        "model": model.name()
+        "model": model.real_name()
     })
 }
 

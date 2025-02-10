@@ -5,7 +5,7 @@ use super::{
 };
 
 use crate::config::Config;
-use crate::utils::estimate_token_length;
+use crate::utils::{estimate_token_length, strip_think_tag};
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,10 @@ impl Model {
         &self.data.name
     }
 
+    pub fn real_name(&self) -> &str {
+        self.data.real_name.as_deref().unwrap_or(&self.data.name)
+    }
+
     pub fn model_type(&self) -> ModelType {
         if self.data.model_type.starts_with("embed") {
             ModelType::Embedding
@@ -131,6 +135,7 @@ impl Model {
                     output_price,
                     supports_vision,
                     supports_function_calling,
+                    supports_reasoning,
                     ..
                 } = &self.data;
                 let max_input_tokens = stringify_option_value(max_input_tokens);
@@ -144,6 +149,9 @@ impl Model {
                 if *supports_function_calling {
                     capabilities.push('⚒');
                 };
+                if *supports_reasoning {
+                    capabilities.push('💭');
+                }
                 let capabilities: String = capabilities
                     .into_iter()
                     .map(|v| format!("{v} "))
@@ -176,6 +184,10 @@ impl Model {
 
     pub fn max_output_tokens(&self) -> Option<isize> {
         self.data.max_output_tokens
+    }
+
+    pub fn supports_reasoning(&self) -> bool {
+        self.data.supports_reasoning
     }
 
     pub fn no_stream(&self) -> bool {
@@ -220,10 +232,18 @@ impl Model {
     }
 
     pub fn messages_tokens(&self, messages: &[Message]) -> usize {
+        let messages_len = messages.len();
         messages
             .iter()
-            .map(|v| match &v.content {
-                MessageContent::Text(text) => estimate_token_length(text),
+            .enumerate()
+            .map(|(i, v)| match &v.content {
+                MessageContent::Text(text) => {
+                    if v.role.is_assistant() && i != messages_len - 1 {
+                        estimate_token_length(&strip_think_tag(text))
+                    } else {
+                        estimate_token_length(text)
+                    }
+                }
                 MessageContent::Array(list) => list
                     .iter()
                     .map(|v| match v {
@@ -278,6 +298,8 @@ pub struct ModelData {
     #[serde(default = "default_model_type", rename = "type")]
     pub model_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub real_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price: Option<f64>,
@@ -293,6 +315,8 @@ pub struct ModelData {
     pub supports_vision: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_function_calling: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    supports_reasoning: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     no_stream: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
