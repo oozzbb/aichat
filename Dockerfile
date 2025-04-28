@@ -1,5 +1,5 @@
 # Use Alpine Linux for the builder stage
-FROM rust:1.75-alpine AS builder
+FROM rust:latest AS builder
 
 # Install build dependencies
 RUN apk add --no-cache musl-dev openssl-dev
