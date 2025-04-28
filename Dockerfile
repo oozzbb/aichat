@@ -1,5 +1,5 @@
 # Use Alpine Linux for the builder stage
-FROM rust:latest AS builder
+FROM rust:alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache musl-dev openssl-dev
@@ -14,7 +14,7 @@ COPY . .
 RUN cargo build --release
 
 # Use Alpine Linux for the final stage
-FROM alpine:3.18
+FROM alpine:latest
 
 # Install runtime dependencies
 RUN apk add --no-cache libgcc openssl ca-certificates
